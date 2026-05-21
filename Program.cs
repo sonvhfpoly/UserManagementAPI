@@ -1,41 +1,103 @@
+using System.ComponentModel.DataAnnotations;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Swashbuckle.AspNetCore.SwaggerGen;
+using UserManagementAPI.Data;
+using UserManagementAPI.Middleware;
+using UserManagementAPI.Models;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
-builder.Services.AddOpenApi();
+// Configure EF Core with SQLite
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlite($"Data Source={AppDomain.CurrentDomain.BaseDirectory}app.db"));
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+// Ensure DB created and apply migrations if any
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+    db.Database.EnsureCreated();
+}
+
+app.UseMiddleware<ErrorHandlingMiddleware>();
+app.UseMiddleware<TokenAuthenticationMiddleware>();
+app.UseMiddleware<RequestLoggingMiddleware>();
+
 if (app.Environment.IsDevelopment())
 {
-    app.MapOpenApi();
+    app.UseSwagger();
+    app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
-
-var summaries = new[]
+app.MapGet("/api/users", async (ApplicationDbContext db) =>
 {
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+    var users = await db.Users.AsNoTracking().ToListAsync();
+    return Results.Ok(users);
+});
 
-app.MapGet("/weatherforecast", () =>
+app.MapGet("/api/users/{id:int}", async (int id, ApplicationDbContext db) =>
 {
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
+    var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == id);
+    return user is not null ? Results.Ok(user) : Results.NotFound();
+});
+
+app.MapPost("/api/users", async (User user, ApplicationDbContext db) =>
+{
+    if (user is null)
+        return Results.BadRequest(new { error = "User payload is required." });
+
+    var validationErrors = ValidateUser(user).ToList();
+    if (validationErrors.Any())
+        return Results.BadRequest(new { errors = validationErrors.Select(e => e.ErrorMessage).ToArray() });
+
+    user.CreatedAt = DateTime.UtcNow;
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
+    return Results.Created($"/api/users/{user.Id}", user);
+});
+
+app.MapPut("/api/users/{id:int}", async (int id, User updated, ApplicationDbContext db) =>
+{
+    if (updated is null)
+        return Results.BadRequest(new { error = "User payload is required." });
+
+    var validationErrors = ValidateUser(updated).ToList();
+    if (validationErrors.Any())
+        return Results.BadRequest(new { errors = validationErrors.Select(e => e.ErrorMessage).ToArray() });
+
+    var user = await db.Users.FindAsync(id);
+    if (user is null)
+        return Results.NotFound();
+
+    user.FirstName = updated.FirstName;
+    user.LastName = updated.LastName;
+    user.Email = updated.Email;
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+});
+
+app.MapDelete("/api/users/{id:int}", async (int id, ApplicationDbContext db) =>
+{
+    var user = await db.Users.FindAsync(id);
+    if (user is null)
+        return Results.NotFound();
+
+    db.Users.Remove(user);
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+});
+
+static IEnumerable<ValidationResult> ValidateUser(User user)
+{
+    var validationResults = new List<ValidationResult>();
+    var validationContext = new ValidationContext(user);
+    Validator.TryValidateObject(user, validationContext, validationResults, true);
+    return validationResults;
+}
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
